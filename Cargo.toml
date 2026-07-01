@@ -2,9 +2,11 @@
 name = "sparse-hash-map"
 version = "0.1.0"
 edition = "2021"
-description = "memory-efficient sparse hash map/set"
+description = "Open-addressing hash map and set that stay small at low load factor"
 license = "MIT"
 repository = "https://github.com/hey-jj/sparse-hash-map"
 readme = "README.md"
+keywords = ["hashmap", "hashset", "sparse", "memory", "hash"]
+categories = ["data-structures"]
 
 [dependencies]
