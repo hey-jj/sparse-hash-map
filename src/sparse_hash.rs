@@ -28,6 +28,11 @@ pub const DEFAULT_INIT_BUCKET_COUNT: usize = 0;
 /// Default maximum load factor before a grow.
 pub const DEFAULT_MAX_LOAD_FACTOR: f32 = 0.5;
 
+/// The largest logical bucket count the bucket vector can hold.
+///
+/// A request above this is a length error regardless of the growth policy.
+const MAX_BUCKET_COUNT: usize = isize::MAX as usize;
+
 /// How a stored value exposes its lookup key.
 ///
 /// The map implements this to read `pair.0`. The set implements it as identity.
@@ -72,6 +77,12 @@ where
         max_load_factor: f32,
     ) -> Result<Self, LengthError> {
         let (policy, settled) = P::new(bucket_count)?;
+
+        // The bucket vector cannot exceed this many entries. A request past it
+        // is a length error even when the policy would allow it.
+        if settled > MAX_BUCKET_COUNT {
+            return Err(LengthError);
+        }
 
         let mut sparse_buckets = Vec::new();
         if settled > 0 {
@@ -125,13 +136,13 @@ where
     /// The largest bucket count the bucket vector can hold.
     #[inline]
     pub fn max_bucket_count(&self) -> usize {
-        isize::MAX as usize
+        MAX_BUCKET_COUNT
     }
 
     /// The largest number of elements the container can hold.
     #[inline]
     pub fn max_size(&self) -> usize {
-        isize::MAX as usize
+        MAX_BUCKET_COUNT
     }
 
     /// Ratio of elements to buckets. Zero for an empty table.

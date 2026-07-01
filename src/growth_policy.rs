@@ -218,7 +218,10 @@ impl<const NUM: usize, const DEN: usize> GrowthPolicy for Mod<NUM, DEN> {
 }
 
 /// The prime table used by [`Prime`]. Ascending, 40 entries.
-pub(crate) const PRIMES: [usize; 40] = [
+///
+/// Exposed so callers can reason about the growth sequence. A `Prime` policy
+/// steps through these on each growth.
+pub const PRIMES_TABLE: [usize; 40] = [
     1, 5, 17, 29, 37, 53, 67, 79, 97, 131, 193, 257, 389, 521, 769, 1031, 1543, 2053, 3079, 6151,
     12289, 24593, 49157, 98317, 196613, 393241, 786433, 1572869, 3145739, 6291469, 12582917,
     25165843, 50331653, 100663319, 201326611, 402653189, 805306457, 1610612741, 3221225473,
@@ -238,13 +241,13 @@ pub struct Prime {
 impl GrowthPolicy for Prime {
     fn new(min_bucket_count: usize) -> Result<(Self, usize), LengthError> {
         // Lower bound: first prime not less than the request.
-        let iprime = PRIMES.partition_point(|&p| p < min_bucket_count);
-        if iprime == PRIMES.len() {
+        let iprime = PRIMES_TABLE.partition_point(|&p| p < min_bucket_count);
+        if iprime == PRIMES_TABLE.len() {
             return Err(LengthError);
         }
 
         let settled = if min_bucket_count > 0 {
-            PRIMES[iprime]
+            PRIMES_TABLE[iprime]
         } else {
             0
         };
@@ -253,18 +256,18 @@ impl GrowthPolicy for Prime {
 
     #[inline]
     fn bucket_for_hash(&self, hash: usize) -> usize {
-        hash % PRIMES[self.iprime]
+        hash % PRIMES_TABLE[self.iprime]
     }
 
     fn next_bucket_count(&self) -> Result<usize, LengthError> {
-        if self.iprime + 1 >= PRIMES.len() {
+        if self.iprime + 1 >= PRIMES_TABLE.len() {
             return Err(LengthError);
         }
-        Ok(PRIMES[self.iprime + 1])
+        Ok(PRIMES_TABLE[self.iprime + 1])
     }
 
     fn max_bucket_count(&self) -> usize {
-        PRIMES[PRIMES.len() - 1]
+        PRIMES_TABLE[PRIMES_TABLE.len() - 1]
     }
 
     fn clear(&mut self) {

@@ -588,6 +588,27 @@ where
     }
 }
 
+impl<K, V, H, E, P, S, Q> core::ops::Index<&Q> for SparseMap<K, V, H, E, P, S>
+where
+    K: Borrow<Q>,
+    Q: ?Sized,
+    H: HashKey<K> + HashKey<Q> + Clone,
+    E: EqKey<K, K> + EqKey<K, Q> + Clone,
+    P: GrowthPolicy,
+    S: Sparsity,
+{
+    type Output = V;
+
+    /// The value at `key`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `key` is not present.
+    fn index(&self, key: &Q) -> &V {
+        self.at(key)
+    }
+}
+
 impl<K, V, H, E, P, S> Clone for SparseMap<K, V, H, E, P, S>
 where
     (K, V): Clone,
