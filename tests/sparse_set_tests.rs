@@ -190,6 +190,28 @@ fn test_serialize_deserialize() {
 }
 
 #[test]
+fn test_unicode_and_boundary_string_keys() {
+    // Empty, multibyte, and long keys must be distinct and round-trip.
+    let mut set: SparseSet<String> = SparseSet::new();
+    let keys: Vec<String> = ["", "café", "naïve", "日本語", "🦀rust"]
+        .iter()
+        .map(|s| s.to_string())
+        .chain(std::iter::once("z".repeat(500)))
+        .collect();
+
+    for k in &keys {
+        assert!(set.insert(k.clone()));
+    }
+    assert_eq!(set.len(), keys.len());
+    for k in &keys {
+        assert!(set.contains(k.as_str()));
+    }
+    assert!(set.contains(""));
+    assert_eq!(set.erase(""), 1);
+    assert!(!set.contains(""));
+}
+
+#[test]
 fn test_prime_growth_set() {
     let mut set: SparsePgSet<i64> = SparsePgSet::with_parts(0, StdHash::default(), StdEq);
     for i in 0..500i64 {

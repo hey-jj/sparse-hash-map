@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{IdentityHash, ModHash, MoveOnly, TestType, VecDeserializer, VecSerializer};
+use common::{CopyOnly, IdentityHash, ModHash, MoveOnly, TestType, VecDeserializer, VecSerializer};
 use sparse_hash_map::{
     EqKey, GrowthPolicy, HashKey, Mod, PowerOfTwo, SparseMap, SparsePgMap, Sparsity, StdEq, StdHash,
 };
@@ -368,6 +368,55 @@ mod sweep {
         ModHash<9>,
         PowerOfTwo<2>,
         sparse_hash_map::Low
+    );
+
+    // Copy-only value type. This value type has no move-only marker, so it
+    // drives the copying capacity path in the sparse array. Sweeping it across
+    // the policies checks that path under collisions and rehashes.
+    sweep_case!(
+        insert_copyonly,
+        body_insert,
+        CopyOnly,
+        CopyOnly,
+        ModHash<9>,
+        PowerOfTwo<2>,
+        sparse_hash_map::Medium
+    );
+    sweep_case!(
+        insert_copyonly_pow4,
+        body_insert,
+        CopyOnly,
+        CopyOnly,
+        ModHash<9>,
+        PowerOfTwo<4>,
+        sparse_hash_map::Medium
+    );
+    sweep_case!(
+        insert_copyonly_mod,
+        body_insert,
+        CopyOnly,
+        CopyOnly,
+        ModHash<9>,
+        Mod,
+        sparse_hash_map::Medium
+    );
+    sweep_case!(
+        erase_loop_copyonly,
+        body_erase_loop,
+        CopyOnly,
+        CopyOnly,
+        ModHash<9>,
+        PowerOfTwo<2>,
+        sparse_hash_map::Medium
+    );
+    sweep_case!(
+        ie_insert_copyonly,
+        body_insert_erase_insert,
+        CopyOnly,
+        CopyOnly,
+        ModHash<9>,
+        PowerOfTwo<2>,
+        sparse_hash_map::Medium
     );
 }
 
@@ -921,4 +970,115 @@ fn test_serialize_deserialize_error_paths() {
     let mut r = VecDeserializer::new(&bytes);
     let out = SparseMap::<i64, i64>::deserialize_with(&mut r, false, StdHash::default(), StdEq);
     assert!(out.is_err());
+}
+
+// A deterministic hasher that differs from the default. It offsets a stable
+// hash by a constant so the same key hashes the same way on every call.
+#[derive(Clone, Default)]
+struct OffsetHash;
+
+impl HashKey<String> for OffsetHash {
+    fn hash_key(&self, key: &String) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut h);
+        (h.finish() as usize).wrapping_add(123)
+    }
+}
+
+#[test]
+fn test_serialize_deserialize_with_different_hash() {
+    // Serialize with the default hasher, deserialize into a map with a different
+    // hasher. With hash_compatible false the values are re-hashed, so every key
+    // must still be found.
+    let mut map: SparseMap<String, i64> = SparseMap::new();
+    for i in 0..1000usize {
+        map.insert(format!("Key {i}"), i as i64);
+    }
+
+    let bytes = serialize_bytes(&map);
+    let mut r = VecDeserializer::new(&bytes);
+    let out =
+        SparseMap::<String, i64, OffsetHash>::deserialize_with(&mut r, false, OffsetHash, StdEq)
+            .unwrap();
+
+    assert_eq!(out.len(), map.len());
+    for (k, v) in map.iter() {
+        assert_eq!(out.get(k), Some(v));
+    }
+}
+
+#[test]
+fn test_deserialize_hash_compatible_error_paths() {
+    // Header layout: version, bucket_count, nb_sparse, nb_elements, nb_deleted
+    // as u64 each, then max_load_factor as f32.
+    let mut map: SparseMap<i64, i64> = SparseMap::new();
+    for i in 0..100i64 {
+        map.insert(i, i);
+    }
+    let good = serialize_bytes(&map);
+
+    // A sparse_bucket_size larger than the platform bitmap width is rejected.
+    // The first per-array size field sits after the 5 u64 fields and the f32.
+    {
+        let mut bytes = serialize_bytes(&SparseMap::<i64, i64>::from([(1, 1)]));
+        let off = 5 * 8 + 4;
+        bytes[off..off + 8].copy_from_slice(&999u64.to_le_bytes());
+        let mut r = VecDeserializer::new(&bytes);
+        let out = SparseMap::<i64, i64>::deserialize_with(&mut r, true, StdHash::default(), StdEq);
+        assert!(out.is_err(), "oversized sparse bucket must fail");
+    }
+
+    // A bucket_count that the growth policy would round to a different value is
+    // rejected under hash_compatible. 300 is not a power of two.
+    {
+        let mut bytes = good.clone();
+        bytes[8..16].copy_from_slice(&300u64.to_le_bytes());
+        let mut r = VecDeserializer::new(&bytes);
+        let out = SparseMap::<i64, i64>::deserialize_with(&mut r, true, StdHash::default(), StdEq);
+        assert!(out.is_err(), "growth policy mismatch must fail");
+    }
+
+    // A max_load_factor below the actual load factor is rejected. Forcing it to
+    // 0.1 while the table is fuller trips the guard.
+    {
+        let mut bytes = good.clone();
+        bytes[40..44].copy_from_slice(&0.1f32.to_le_bytes());
+        let mut r = VecDeserializer::new(&bytes);
+        let out = SparseMap::<i64, i64>::deserialize_with(&mut r, true, StdHash::default(), StdEq);
+        assert!(out.is_err(), "load factor guard must fail");
+    }
+}
+
+#[test]
+fn test_unicode_and_boundary_string_keys() {
+    // Empty, multibyte, and long keys must round-trip through insert, lookup,
+    // and erase without truncation or collision.
+    let mut map: SparseMap<String, i64> = SparseMap::new();
+    let keys: Vec<String> = ["", "café", "naïve", "日本語", "🦀rust"]
+        .iter()
+        .map(|s| s.to_string())
+        .chain(std::iter::once("a".repeat(1000)))
+        .collect();
+
+    for (i, k) in keys.iter().enumerate() {
+        assert!(map.insert(k.clone(), i as i64));
+    }
+    assert_eq!(map.len(), keys.len());
+    for (i, k) in keys.iter().enumerate() {
+        assert_eq!(map.get(k.as_str()), Some(&(i as i64)));
+    }
+
+    assert_eq!(map.get(""), Some(&0));
+    assert_eq!(map.erase(""), 1);
+    assert!(map.get("").is_none());
+    assert_eq!(map.len(), keys.len() - 1);
+}
+
+#[test]
+fn test_max_size_and_max_bucket_count() {
+    let map: SparseMap<i64, i64> = SparseMap::new();
+    // Both limits report a large capacity for a fresh map.
+    assert!(map.max_size() > 1000);
+    assert!(map.max_bucket_count() > 1000);
 }
