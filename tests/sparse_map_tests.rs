@@ -852,10 +852,134 @@ fn test_precalculated_hash() {
     assert_eq!(map.get_precalc(&3, h), Some(&-3));
     assert_eq!(map.at_precalc(&3, h), &-3);
     assert!(map.contains_key_precalc(&3, h));
+    assert_eq!(map.count_precalc(&3, h), 1);
+
+    let absent = map.hash_function().hash_key(&99);
+    assert_eq!(map.count_precalc(&99, absent), 0);
 
     let mut map = map;
     assert_eq!(map.erase_precalc(&3, h), 1);
     assert!(map.get(&3).is_none());
+}
+
+#[test]
+fn test_equal_range() {
+    let map: SparseMap<i32, i32> = SparseMap::from([(0, 10), (-2, 20)]);
+
+    // A present key yields a range of length 1 with the stored pair.
+    let mut range = map.equal_range(&0);
+    assert_eq!(range.len(), 1);
+    assert_eq!(range.next(), Some((&0, &10)));
+    assert_eq!(range.next(), None);
+
+    // An absent key yields an empty range.
+    let mut empty = map.equal_range(&1);
+    assert_eq!(empty.len(), 0);
+    assert_eq!(empty.next(), None);
+}
+
+#[test]
+fn test_equal_range_precalc() {
+    let map: SparseMap<i32, i32, IdentityHash> = {
+        let mut m = SparseMap::with_parts(0, IdentityHash, StdEq);
+        m.insert(0, 10);
+        m.insert(2, 20);
+        m
+    };
+
+    let h = map.hash_function().hash_key(&2);
+    let found: Vec<_> = map.equal_range_precalc(&2, h).collect();
+    assert_eq!(found, vec![(&2, &20)]);
+
+    let absent = map.hash_function().hash_key(&5);
+    assert_eq!(map.equal_range_precalc(&5, absent).count(), 0);
+}
+
+#[test]
+fn test_owning_into_iter_and_collect() {
+    let map: SparseMap<i64, i64> = SparseMap::from([(1, 10), (2, 20), (3, 30)]);
+
+    // Move entries out and rebuild an ordinary collection.
+    let mut pairs: Vec<(i64, i64)> = map.into_iter().collect();
+    pairs.sort_unstable();
+    assert_eq!(pairs, vec![(1, 10), (2, 20), (3, 30)]);
+}
+
+#[test]
+fn test_into_iter_moves_move_only_values() {
+    let mut map: SparseMap<i64, MoveOnly> = SparseMap::new();
+    map.insert(1, MoveOnly::from_i64(11));
+    map.insert(2, MoveOnly::from_i64(22));
+
+    let mut got: Vec<(i64, String)> = map
+        .into_iter()
+        .map(|(k, v)| (k, v.value().to_string()))
+        .collect();
+    got.sort();
+    assert_eq!(got, vec![(1, "11".to_string()), (2, "22".to_string())]);
+}
+
+#[test]
+fn test_iter_mut_over_ref() {
+    let mut map: SparseMap<i64, i64> = SparseMap::from([(1, 1), (2, 2), (3, 3)]);
+    for (_, v) in &mut map {
+        *v *= 10;
+    }
+    let mut vals: Vec<i64> = map.values().copied().collect();
+    vals.sort_unstable();
+    assert_eq!(vals, vec![10, 20, 30]);
+}
+
+#[test]
+fn test_extend() {
+    let mut map: SparseMap<i64, i64> = SparseMap::new();
+    map.extend([(1, 1), (2, 2)]);
+    map.extend(vec![(3, 3), (2, 99)]); // present key keeps its value
+    assert_eq!(map.len(), 3);
+    assert_eq!(map[&1], 1);
+    assert_eq!(map[&2], 2);
+    assert_eq!(map[&3], 3);
+}
+
+#[test]
+fn test_retain() {
+    let mut map: SparseMap<i64, i64> = (0..100).map(|i| (i, i)).collect();
+    map.retain(|k, _| k % 2 == 0);
+    assert_eq!(map.len(), 50);
+    for i in 0..100 {
+        assert_eq!(map.contains_key(&i), i % 2 == 0);
+    }
+
+    // The retained entries still round-trip through lookup after the shifts.
+    for i in (0..100).step_by(2) {
+        assert_eq!(map[&i], i);
+    }
+}
+
+#[test]
+fn test_retain_can_mutate_values() {
+    let mut map: SparseMap<i64, i64> = (0..10).map(|i| (i, i)).collect();
+    map.retain(|_, v| {
+        *v += 1;
+        true
+    });
+    for i in 0..10 {
+        assert_eq!(map[&i], i + 1);
+    }
+}
+
+#[test]
+fn test_try_insert_returns_rejected_value() {
+    let mut map: SparseMap<i64, MoveOnly> = SparseMap::new();
+    assert!(map.try_insert(1, MoveOnly::from_i64(10)).is_ok());
+
+    // A collision hands the value back instead of dropping it.
+    let rejected = map.try_insert(1, MoveOnly::from_i64(99));
+    let (k, v) = rejected.expect_err("key already present");
+    assert_eq!(k, 1);
+    assert_eq!(v.value(), "99");
+    // The stored value is untouched.
+    assert_eq!(map.get(&1).unwrap().value(), "10");
 }
 
 #[test]
@@ -1047,6 +1171,40 @@ fn test_deserialize_hash_compatible_error_paths() {
         let mut r = VecDeserializer::new(&bytes);
         let out = SparseMap::<i64, i64>::deserialize_with(&mut r, true, StdHash::default(), StdEq);
         assert!(out.is_err(), "load factor guard must fail");
+    }
+
+    // A bitmap_vals whose popcount disagrees with the value count is rejected.
+    // Set a bit in the first array's value bitmap while its size field stays 0.
+    // The bitmap_vals field is the second u64 of the first per-array record.
+    {
+        let mut bytes = good.clone();
+        let bitmap_off = 5 * 8 + 4 + 8;
+        bytes[bitmap_off..bitmap_off + 8].copy_from_slice(&1u64.to_le_bytes());
+        let mut r = VecDeserializer::new(&bytes);
+        let out = SparseMap::<i64, i64>::deserialize_with(&mut r, true, StdHash::default(), StdEq);
+        assert!(out.is_err(), "bitmap popcount mismatch must fail");
+    }
+
+    // A slot marked both present and deleted is rejected. Copy the value bitmap
+    // of the first array into its deleted bitmap so the two overlap.
+    {
+        let mut bytes = good.clone();
+        let vals_off = 5 * 8 + 4 + 8;
+        let del_off = vals_off + 8;
+        let vals = {
+            let mut a = [0u8; 8];
+            a.copy_from_slice(&bytes[vals_off..vals_off + 8]);
+            a
+        };
+        bytes[del_off..del_off + 8].copy_from_slice(&vals);
+        // Only meaningful when the first array holds a value. Skip the assert if
+        // the first array is empty, since then the bitmaps are both zero.
+        if u64::from_le_bytes(vals) != 0 {
+            let mut r = VecDeserializer::new(&bytes);
+            let out =
+                SparseMap::<i64, i64>::deserialize_with(&mut r, true, StdHash::default(), StdEq);
+            assert!(out.is_err(), "present-and-deleted slot must fail");
+        }
     }
 }
 

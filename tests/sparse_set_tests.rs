@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{MoveOnly, TestType, VecDeserializer, VecSerializer};
+use common::{IdentityHash, MoveOnly, TestType, VecDeserializer, VecSerializer};
 use sparse_hash_map::{
     EqKey, GrowthPolicy, HashKey, Mod, SparsePgSet, SparseSet, Sparsity, StdEq, StdHash,
 };
@@ -220,5 +220,59 @@ fn test_prime_growth_set() {
     assert_eq!(set.len(), 500);
     for i in 0..500i64 {
         assert!(set.contains(&i));
+    }
+}
+
+#[test]
+fn test_count_and_equal_range_precalc() {
+    let set: SparseSet<i32, IdentityHash> = {
+        let mut s = SparseSet::with_parts(0, IdentityHash, StdEq);
+        for k in [1, 2, 3, 4, 5, 6] {
+            s.insert(k);
+        }
+        s
+    };
+
+    let h = set.hash_function().hash_key(&3);
+    assert_eq!(set.count_precalc(&3, h), 1);
+    assert!(set.contains_precalc(&3, h));
+    let found: Vec<_> = set.equal_range_precalc(&3, h).collect();
+    assert_eq!(found, vec![&3]);
+
+    let absent = set.hash_function().hash_key(&99);
+    assert_eq!(set.count_precalc(&99, absent), 0);
+    assert_eq!(set.equal_range_precalc(&99, absent).count(), 0);
+}
+
+#[test]
+fn test_equal_range() {
+    let set: SparseSet<i32> = SparseSet::from([0, -2]);
+
+    let mut range = set.equal_range(&0);
+    assert_eq!(range.len(), 1);
+    assert_eq!(range.next(), Some(&0));
+    assert_eq!(range.next(), None);
+
+    assert_eq!(set.equal_range(&1).count(), 0);
+}
+
+#[test]
+fn test_owning_into_iter() {
+    let set: SparseSet<i64> = SparseSet::from([1, 2, 3]);
+    let mut keys: Vec<i64> = set.into_iter().collect();
+    keys.sort_unstable();
+    assert_eq!(keys, vec![1, 2, 3]);
+}
+
+#[test]
+fn test_extend_and_retain() {
+    let mut set: SparseSet<i64> = SparseSet::new();
+    set.extend(0..100);
+    assert_eq!(set.len(), 100);
+
+    set.retain(|k| k % 3 == 0);
+    assert_eq!(set.len(), 34);
+    for i in 0..100 {
+        assert_eq!(set.contains(&i), i % 3 == 0);
     }
 }

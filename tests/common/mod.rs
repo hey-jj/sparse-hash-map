@@ -203,6 +203,9 @@ impl<'a> Deserializer for VecDeserializer<'a> {
         self.pos += len;
         s
     }
+    fn remaining(&self) -> Option<usize> {
+        Some(self.buf.len().saturating_sub(self.pos))
+    }
 }
 
 /// Convenience aliases used across test files.
