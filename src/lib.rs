@@ -48,12 +48,13 @@
 pub mod growth_policy;
 pub mod hasher;
 mod map;
-pub mod popcount;
+mod popcount;
 pub mod serialize;
 mod set;
 mod sparse_array;
 mod sparse_hash;
 pub mod sparsity;
+mod util;
 
 pub use crate::growth_policy::{GrowthPolicy, LengthError, Mod, PowerOfTwo, Prime};
 pub use crate::hasher::{EqKey, FnHash, HashKey, StdEq, StdHash};
@@ -79,13 +80,8 @@ where
     K: Hash + Eq,
 {
     fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
-        let iter = iter.into_iter();
         let mut map = SparseMap::new();
-        let (lower, _) = iter.size_hint();
-        map.reserve(lower);
-        for (k, v) in iter {
-            map.insert(k, v);
-        }
+        map.extend(iter);
         map
     }
 }
@@ -104,13 +100,8 @@ where
     K: Hash + Eq,
 {
     fn from_iter<I: IntoIterator<Item = K>>(iter: I) -> Self {
-        let iter = iter.into_iter();
         let mut set = SparseSet::new();
-        let (lower, _) = iter.size_hint();
-        set.reserve(lower);
-        for k in iter {
-            set.insert(k);
-        }
+        set.extend(iter);
         set
     }
 }

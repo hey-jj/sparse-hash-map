@@ -36,6 +36,16 @@ pub trait Deserializer {
     fn read_f32(&mut self) -> f32;
     /// Read `len` raw bytes.
     fn read_bytes(&mut self, len: usize) -> Vec<u8>;
+
+    /// Bytes still available to read, when the source knows its length.
+    ///
+    /// A variable-length [`Deserialize`] impl checks this before allocating a
+    /// buffer sized by a length read from the input. A source that cannot report
+    /// its length returns `None`, and the impl allocates as before. The default
+    /// returns `None`.
+    fn remaining(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// A value type that can be written to a [`Serializer`].
@@ -77,6 +87,12 @@ impl Serialize for String {
 impl Deserialize for String {
     fn deserialize<D: Deserializer>(deserializer: &mut D) -> Self {
         let len = deserializer.read_u64() as usize;
+        if let Some(remaining) = deserializer.remaining() {
+            assert!(
+                len <= remaining,
+                "deserialized string length {len} exceeds the {remaining} bytes left in the input"
+            );
+        }
         let bytes = deserializer.read_bytes(len);
         String::from_utf8(bytes).expect("deserialized string is not valid utf-8")
     }

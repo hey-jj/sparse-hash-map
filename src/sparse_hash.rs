@@ -19,7 +19,8 @@ use crate::serialize::{
     SERIALIZATION_PROTOCOL_VERSION,
 };
 use crate::sparse_array::{
-    index_in_sparse_bucket, nb_sparse_buckets, sparse_ibucket, Bitmap, SparseArray, BITMAP_NB_BITS,
+    index_in_sparse_bucket, nb_sparse_buckets, popcount_bitmap, sparse_ibucket, Bitmap,
+    SparseArray, BITMAP_NB_BITS,
 };
 use crate::sparsity::Sparsity;
 
@@ -61,11 +62,7 @@ pub struct SparseHash<T, K, H, E, P, S> {
 
 impl<T, K, H, E, P, S> SparseHash<T, K, H, E, P, S>
 where
-    K: KeySelect<T>,
-    H: HashKey<K::Key>,
-    E: EqKey<K::Key, K::Key>,
     P: GrowthPolicy,
-    S: Sparsity,
 {
     /// Build an engine sized for at least `bucket_count` buckets.
     ///
@@ -320,7 +317,12 @@ where
         self.insert_with_hash(value, hash)
     }
 
-    fn insert_with_hash(&mut self, value: T, hash: usize) -> (Position, bool) {
+    /// Insert `value` with a precomputed hash of its key.
+    ///
+    /// The hash must equal `hash_function().hash_key(K::key(&value))`. Callers
+    /// that already computed the hash for a lookup pass it here to avoid a second
+    /// hash on the insert path.
+    pub fn insert_with_hash(&mut self, value: T, hash: usize) -> (Position, bool) {
         loop {
             // A fresh table has no sparse arrays. The first probe would land on
             // the shared empty slot, which confirms the key is absent and, with
@@ -393,7 +395,7 @@ where
     }
 
     fn insert_in_bucket(&mut self, sib: usize, index: u8, value: T) -> Position {
-        self.sparse_buckets[sib].set(index, value);
+        self.sparse_buckets[sib].set(index, value, S::STEP as usize);
         self.nb_elements += 1;
         Position {
             sparse_ibucket: sib,
@@ -437,7 +439,7 @@ where
             if bucket.has_value(idx) {
                 if self.key_eq.eq_key(K::key(bucket.value(idx)), key) {
                     let offset = self.sparse_buckets[sib].index_to_offset(idx);
-                    self.sparse_buckets[sib].erase(offset, idx);
+                    self.sparse_buckets[sib].remove_value(offset, idx);
                     self.nb_elements -= 1;
                     self.nb_deleted_buckets += 1;
                     return 1;
@@ -474,6 +476,61 @@ where
         Some(value)
     }
 
+    /// Erase every element in one pass, leaving tombstones.
+    ///
+    /// Walks each sparse array once and tombstones its present slots, so the
+    /// cost is linear in the array count plus the element count. Draining with
+    /// `remove_nth(0)` in a loop would rescan from the front each time.
+    pub fn erase_all(&mut self) {
+        for bucket in &mut self.sparse_buckets {
+            let removed = bucket.erase_all();
+            self.nb_deleted_buckets += removed;
+        }
+        self.nb_elements = 0;
+    }
+
+    /// Erase `count` elements starting at iteration index `skip`, leaving
+    /// tombstones.
+    ///
+    /// Advances one cursor to `skip`, then erases consecutive live slots while
+    /// walking forward. Erasing at a dense offset shifts the tail of that array
+    /// down by one, so the next live slot sits at the same offset until the
+    /// array runs out. Stops early when the table ends.
+    pub fn erase_range(&mut self, skip: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let Some((mut sib, mut offset)) = self.first_position() else {
+            return;
+        };
+        for _ in 0..skip {
+            match self.next_position(sib, offset) {
+                Some((s, o)) => {
+                    sib = s;
+                    offset = o;
+                }
+                None => return,
+            }
+        }
+        for _ in 0..count {
+            while offset >= self.sparse_buckets[sib].len() {
+                let mut n = sib + 1;
+                while n < self.sparse_buckets.len() && self.sparse_buckets[n].is_empty() {
+                    n += 1;
+                }
+                if n >= self.sparse_buckets.len() {
+                    return;
+                }
+                sib = n;
+                offset = 0;
+            }
+            let index = self.sparse_buckets[sib].offset_to_index(offset);
+            self.sparse_buckets[sib].remove_value(offset, index);
+            self.nb_elements -= 1;
+            self.nb_deleted_buckets += 1;
+        }
+    }
+
     /// Rebuild the table with `count` buckets and re-insert every element.
     fn rehash_impl(&mut self, count: usize) {
         let mut new_table = SparseHash::<T, K, H, E, P, S>::new(
@@ -502,7 +559,7 @@ where
             let sib = sparse_ibucket(ibucket);
             let idx = index_in_sparse_bucket(ibucket);
             if !self.sparse_buckets[sib].has_value(idx) {
-                self.sparse_buckets[sib].set(idx, value);
+                self.sparse_buckets[sib].set(idx, value, S::STEP as usize);
                 self.nb_elements += 1;
                 return;
             }
@@ -530,6 +587,30 @@ impl<T, K, H, E, P, S> SparseHash<T, K, H, E, P, S> {
     #[inline]
     pub fn value_at_mut(&mut self, pos: Position) -> &mut T {
         self.sparse_buckets[pos.sparse_ibucket].value_mut(pos.index)
+    }
+
+    /// Keep only the values for which `keep` returns true.
+    ///
+    /// Removed values become tombstones, reclaimed on the next grow or cleanup.
+    /// Each array is scanned once. Within an array the dense block shifts as
+    /// slots are removed, so the scan tracks the current offset explicitly.
+    pub fn retain<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(&mut T) -> bool,
+    {
+        for array in &mut self.sparse_buckets {
+            let mut offset = 0;
+            while offset < array.len() {
+                let index = array.offset_to_index(offset);
+                if keep(&mut array.values_mut()[offset]) {
+                    offset += 1;
+                } else {
+                    array.remove_value(offset, index);
+                    self.nb_elements -= 1;
+                    self.nb_deleted_buckets += 1;
+                }
+            }
+        }
     }
 }
 
@@ -572,6 +653,19 @@ impl<T, K, H, E, P, S> SparseHash<T, K, H, E, P, S> {
             pos: self.first_position(),
         }
     }
+
+    /// Consume the table and yield every value by move in iteration order.
+    pub fn into_values(self) -> IntoIter<T> {
+        let mut arrays = self.sparse_buckets.into_iter();
+        let inner = match arrays.next() {
+            Some(a) => a.into_values().into_iter(),
+            None => Vec::new().into_iter(),
+        };
+        IntoIter {
+            inner,
+            remaining_arrays: arrays,
+        }
+    }
 }
 
 /// A forward iterator over shared references to stored values.
@@ -602,6 +696,29 @@ impl<'a, T> Iterator for Iter<'a, T> {
             }
         };
         Some(value)
+    }
+}
+
+/// A forward iterator that moves every value out of a consumed table.
+///
+/// The cursor drains each sparse array's dense block in index order, then moves
+/// to the next non-empty array.
+pub struct IntoIter<T> {
+    inner: std::vec::IntoIter<T>,
+    remaining_arrays: std::vec::IntoIter<SparseArray<T>>,
+}
+
+impl<T> Iterator for IntoIter<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        loop {
+            if let Some(v) = self.inner.next() {
+                return Some(v);
+            }
+            let array = self.remaining_arrays.next()?;
+            self.inner = array.into_values().into_iter();
+        }
     }
 }
 
@@ -730,13 +847,19 @@ where
                     "the growth policy is not the same even though hash_compatible is true",
                 ));
             }
+            if bucket_count_ds > MAX_BUCKET_COUNT {
+                return Err(DeserializeError("bucket count too big"));
+            }
             if nb_sparse != nb_sparse_buckets(bucket_count_ds) {
                 return Err(DeserializeError(
                     "deserialized nb_sparse_buckets is invalid",
                 ));
             }
 
-            let mut sparse_buckets = Vec::with_capacity(nb_sparse);
+            // Grow the vector as arrays are read. Do not pre-allocate from
+            // `nb_sparse`, which is derived from an untrusted bucket count and
+            // could request an allocation that aborts the process.
+            let mut sparse_buckets = Vec::new();
             for _ in 0..nb_sparse {
                 let sparse_bucket_size = deserializer.read_u64() as usize;
                 let bitmap_vals = deserializer.read_u64();
@@ -751,6 +874,21 @@ where
                 let bitmap_deleted: Bitmap = numeric_cast_bitmap(bitmap_deleted).ok_or(
                     DeserializeError("deserialized bitmap_deleted_vals is too big"),
                 )?;
+                // The bitmap and the value count are independent fields. Reject a
+                // file where the popcount disagrees with the value count, or
+                // where a slot is both present and a tombstone. Later lookups
+                // derive dense offsets from the bitmap, so a mismatch would index
+                // past the value block.
+                if popcount_bitmap(bitmap_vals) as usize != sparse_bucket_size {
+                    return Err(DeserializeError(
+                        "deserialized bitmap_vals popcount does not match the value count",
+                    ));
+                }
+                if bitmap_vals & bitmap_deleted != 0 {
+                    return Err(DeserializeError(
+                        "a deserialized slot is both present and a tombstone",
+                    ));
+                }
                 let mut values = Vec::with_capacity(sparse_bucket_size);
                 for _ in 0..sparse_bucket_size {
                     values.push(T::deserialize(deserializer));

@@ -54,34 +54,13 @@ pub fn nb_sparse_buckets(bucket_count: usize) -> usize {
     if bucket_count == 0 {
         return 0;
     }
-    let rounded = round_up_to_power_of_two(bucket_count);
+    let rounded = crate::util::round_up_to_power_of_two(bucket_count);
     core::cmp::max(1, sparse_ibucket(rounded))
 }
 
+/// Count the occupied bits in a bitmap word.
 #[inline]
-fn is_power_of_two(value: usize) -> bool {
-    value != 0 && (value & (value - 1)) == 0
-}
-
-#[inline]
-fn round_up_to_power_of_two(mut value: usize) -> usize {
-    if is_power_of_two(value) {
-        return value;
-    }
-    if value == 0 {
-        return 1;
-    }
-    value -= 1;
-    let mut i = 1;
-    while i < usize::BITS as usize {
-        value |= value >> i;
-        i *= 2;
-    }
-    value + 1
-}
-
-#[inline]
-fn popcount_bitmap(val: Bitmap) -> u8 {
+pub(crate) fn popcount_bitmap(val: Bitmap) -> u8 {
     #[cfg(target_pointer_width = "64")]
     {
         popcountll(val) as u8
@@ -124,6 +103,16 @@ impl<T> SparseArray<T> {
     #[inline]
     pub fn len(&self) -> usize {
         self.values.len()
+    }
+
+    /// The heap capacity of the dense value block.
+    ///
+    /// The block over-allocates in fixed steps set by the sparsity level, so a
+    /// full array reserves exactly `growth_step` more slots rather than doubling.
+    #[cfg(test)]
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.values.capacity()
     }
 
     /// Whether this is the last array in its table.
@@ -216,25 +205,19 @@ impl<T> SparseArray<T> {
 
     /// Insert `value` at logical `index`, which must be empty.
     ///
-    /// Returns the dense offset where the value landed.
-    pub fn set(&mut self, index: u8, value: T) -> usize {
+    /// `growth_step` is the sparsity capacity step. When the block is full it
+    /// grows by exactly `growth_step` slots, not by `Vec` doubling, so the heap
+    /// slack tracks the sparsity level. Returns the dense offset where the value
+    /// landed.
+    pub fn set(&mut self, index: u8, value: T, growth_step: usize) -> usize {
         debug_assert!(!self.has_value(index));
         let offset = self.index_to_offset(index);
+        if self.values.len() == self.values.capacity() {
+            self.values.reserve_exact(growth_step.max(1));
+        }
         self.values.insert(offset, value);
         self.bitmap_vals |= (1 as Bitmap) << index;
         self.bitmap_deleted_vals &= !((1 as Bitmap) << index);
-        offset
-    }
-
-    /// Erase the value at dense `offset`, whose logical index is `index`.
-    ///
-    /// Marks the index as a tombstone and returns the offset, which now points
-    /// at the next value or one past the end.
-    pub fn erase(&mut self, offset: usize, index: u8) -> usize {
-        debug_assert!(self.has_value(index));
-        self.values.remove(offset);
-        self.bitmap_vals &= !((1 as Bitmap) << index);
-        self.bitmap_deleted_vals |= (1 as Bitmap) << index;
         offset
     }
 
@@ -247,6 +230,19 @@ impl<T> SparseArray<T> {
         self.bitmap_vals &= !((1 as Bitmap) << index);
         self.bitmap_deleted_vals |= (1 as Bitmap) << index;
         value
+    }
+
+    /// Tombstone every present value and drop the dense block.
+    ///
+    /// Moves each occupied bit into the tombstone bitmap and clears the value
+    /// bitmap, matching a slot-by-slot erase but in one pass. Returns how many
+    /// values were dropped so the caller can update its counters.
+    pub fn erase_all(&mut self) -> usize {
+        let removed = self.values.len();
+        self.values.clear();
+        self.bitmap_deleted_vals |= self.bitmap_vals;
+        self.bitmap_vals = 0;
+        removed
     }
 
     /// Consume the array and yield its dense values in index order.
@@ -284,5 +280,36 @@ impl<T: Clone> Clone for SparseArray<T> {
 impl<T> Default for SparseArray<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Capacity grows by the fixed step, not by Vec doubling. Fill the low bits
+    // of one array in index order and check the block reserves in steps.
+    #[test]
+    fn capacity_grows_by_fixed_step() {
+        const STEP: usize = 4;
+        let mut array: SparseArray<i32> = SparseArray::new();
+        for index in 0..8u8 {
+            array.set(index, index as i32, STEP);
+            // After each insert the capacity is the value count rounded up to a
+            // multiple of the step. Doubling would jump past these bounds.
+            let expected = array.len().div_ceil(STEP) * STEP;
+            assert_eq!(array.capacity(), expected, "at len {}", array.len());
+        }
+    }
+
+    #[test]
+    fn a_larger_step_reserves_more_slack() {
+        let mut high: SparseArray<i32> = SparseArray::new();
+        let mut low: SparseArray<i32> = SparseArray::new();
+        // One value each. The larger step over-allocates more.
+        high.set(0, 0, 2);
+        low.set(0, 0, 8);
+        assert_eq!(high.capacity(), 2);
+        assert_eq!(low.capacity(), 8);
     }
 }
