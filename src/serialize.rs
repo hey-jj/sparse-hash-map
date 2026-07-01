@@ -57,6 +57,11 @@ pub trait Serialize {
 /// A value type that can be read from a [`Deserializer`].
 pub trait Deserialize: Sized {
     /// Read one value.
+    ///
+    /// This returns `Self`, not a `Result`, so an impl signals a malformed value
+    /// by panicking. The `String` impl panics on a length that overruns the
+    /// input or on invalid UTF-8. A caller reading untrusted bytes should guard
+    /// against a panic here.
     fn deserialize<D: Deserializer>(deserializer: &mut D) -> Self;
 }
 

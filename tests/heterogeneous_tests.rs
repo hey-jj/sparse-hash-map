@@ -1,8 +1,7 @@
 //! Heterogeneous lookup: a key type that is looked up through a borrowed form.
 //!
-//! The canonical case keys on owned pointers and looks up by the raw address.
-//! The Rust analog keys on `Box<i32>` and looks up by the integer inside, using
-//! a hasher and comparator that accept both the stored key and the lookup key.
+//! This keys on `Box<i32>` and looks up by the integer inside, using a hasher
+//! and comparator that accept both the stored key and the lookup key.
 
 mod common;
 

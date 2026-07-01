@@ -1,7 +1,6 @@
-//! Allocation routing. The canonical suite counts allocations through a custom
-//! allocator to prove the container routes all buffers through it. Rust stable
-//! has no per-collection allocator, so this uses a counting global allocator and
-//! checks that inserts allocate and do not explode per element.
+//! Allocation routing. Rust stable has no per-collection allocator, so this
+//! uses a counting global allocator and checks that inserts allocate and do not
+//! explode per element.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};

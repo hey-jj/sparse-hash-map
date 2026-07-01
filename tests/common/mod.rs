@@ -1,6 +1,6 @@
 //! Shared test harness: fixture generators, collision hashers, test value types,
-//! and a binary codec. These reproduce the canonical suite's data so key and
-//! value sequences and collision patterns match.
+//! and a binary codec. These fix the key and value sequences and collision
+//! patterns the tests rely on.
 
 #![allow(dead_code)]
 
@@ -111,7 +111,7 @@ impl CopyOnly {
     }
 }
 
-/// Deterministic key and value generators, matching the canonical formulas.
+/// Deterministic key and value generators keyed on a counter.
 pub trait TestType: Sized + Eq + Hash + std::fmt::Debug {
     fn get_key(counter: usize) -> Self;
     fn get_value(counter: usize) -> Self;
@@ -153,7 +153,7 @@ impl TestType for CopyOnly {
     }
 }
 
-/// A binary writer that matches the canonical wire format.
+/// A binary writer for the test wire format.
 ///
 /// Integers are little-endian. Strings are a `u64` length then the bytes.
 #[derive(Default)]
