@@ -1185,6 +1185,18 @@ fn test_deserialize_hash_compatible_error_paths() {
         assert!(out.is_err(), "bitmap popcount mismatch must fail");
     }
 
+    // An nb_elements header that disagrees with the bitmaps is rejected. Fast
+    // restore drives len and growth from this count, so it must match the
+    // decoded bitmaps rather than be trusted from the stream. The field is the
+    // fourth u64 of the header.
+    {
+        let mut bytes = good.clone();
+        bytes[24..32].copy_from_slice(&1u64.to_le_bytes());
+        let mut r = VecDeserializer::new(&bytes);
+        let out = SparseMap::<i64, i64>::deserialize_with(&mut r, true, StdHash::default(), StdEq);
+        assert!(out.is_err(), "element count mismatch must fail");
+    }
+
     // A slot marked both present and deleted is rejected. Copy the value bitmap
     // of the first array into its deleted bitmap so the two overlap.
     {
@@ -1239,4 +1251,48 @@ fn test_max_size_and_max_bucket_count() {
     // Both limits report a large capacity for a fresh map.
     assert!(map.max_size() > 1000);
     assert!(map.max_bucket_count() > 1000);
+}
+
+#[test]
+fn prime_policy_reports_prime_ceiling() {
+    use sparse_hash_map::growth_policy::PRIMES_TABLE;
+    // The reported ceiling is the growth policy limit, not the vector ceiling.
+    // Prime tops out at its last prime.
+    let map: SparsePgMap<i64, i64> = SparsePgMap::default();
+    let last_prime = PRIMES_TABLE[PRIMES_TABLE.len() - 1];
+    assert_eq!(map.max_bucket_count(), last_prime);
+    assert_eq!(map.max_size(), last_prime);
+}
+
+#[test]
+fn mod_policy_colliding_keys_terminate() {
+    // Identity hash sends every multiple of the table size to bucket 0. On a
+    // non-power-of-two Mod table the triangular probe covers only a subset of
+    // buckets, so a long collision run must still terminate rather than spin.
+    let mut map: SparseMap<i64, i64, IdentityHash, StdEq, Mod<3, 2>, sparse_hash_map::Medium> =
+        SparseMap::with_parts(12, IdentityHash, StdEq);
+    map.set_max_load_factor(0.8);
+    for i in 0..200i64 {
+        map.insert(i * 12, i);
+    }
+    assert_eq!(map.len(), 200);
+    for i in 0..200i64 {
+        assert_eq!(map.get(&(i * 12)), Some(&i));
+    }
+}
+
+#[test]
+fn prime_policy_colliding_keys_terminate() {
+    // The prime policy is recommended for poor hashes. Feeding it the exact
+    // pathological input, keys that all map to one bucket, must terminate.
+    let mut map: SparsePgMap<i64, i64, IdentityHash, StdEq> =
+        SparsePgMap::with_parts(0, IdentityHash, StdEq);
+    map.set_max_load_factor(0.8);
+    for i in 0..200i64 {
+        map.insert(i * 17, i);
+    }
+    assert_eq!(map.len(), 200);
+    for i in 0..200i64 {
+        assert_eq!(map.get(&(i * 17)), Some(&i));
+    }
 }

@@ -130,16 +130,19 @@ where
         self.bucket_count
     }
 
-    /// The largest bucket count the bucket vector can hold.
+    /// The largest bucket count the table can reach.
+    ///
+    /// This is the growth policy ceiling, capped by what the bucket vector can
+    /// hold. For Prime that is the last prime in its table.
     #[inline]
     pub fn max_bucket_count(&self) -> usize {
-        MAX_BUCKET_COUNT
+        self.policy.max_bucket_count().min(MAX_BUCKET_COUNT)
     }
 
     /// The largest number of elements the container can hold.
     #[inline]
     pub fn max_size(&self) -> usize {
-        MAX_BUCKET_COUNT
+        self.max_bucket_count()
     }
 
     /// Ratio of elements to buckets. Zero for an empty table.
@@ -342,6 +345,26 @@ where
             let mut probe = 0usize;
 
             loop {
+                // The triangular probe sequence covers every bucket only for a
+                // power-of-two size. On a Mod or Prime table it can cycle
+                // through a strict subset, so a run of collisions can exhaust
+                // the reachable buckets without touching an empty slot. Once we
+                // have probed bucket_count times the key is absent. Reuse a
+                // tombstone if we found one, otherwise grow and retry.
+                if probe >= self.bucket_count {
+                    if let Some((dsib, didx)) = found_deleted {
+                        let pos = self.insert_in_bucket(dsib, didx, value);
+                        self.nb_deleted_buckets -= 1;
+                        return (pos, true);
+                    }
+                    let count = self
+                        .policy
+                        .next_bucket_count()
+                        .expect("grow within policy limit");
+                    self.rehash_impl(count);
+                    break;
+                }
+
                 let sib = sparse_ibucket(ibucket);
                 let idx = index_in_sparse_bucket(ibucket);
                 let bucket = &self.sparse_buckets[sib];
@@ -860,6 +883,8 @@ where
             // `nb_sparse`, which is derived from an untrusted bucket count and
             // could request an allocation that aborts the process.
             let mut sparse_buckets = Vec::new();
+            let mut present_count = 0usize;
+            let mut deleted_count = 0usize;
             for _ in 0..nb_sparse {
                 let sparse_bucket_size = deserializer.read_u64() as usize;
                 let bitmap_vals = deserializer.read_u64();
@@ -889,6 +914,8 @@ where
                         "a deserialized slot is both present and a tombstone",
                     ));
                 }
+                present_count += sparse_bucket_size;
+                deleted_count += popcount_bitmap(bitmap_deleted) as usize;
                 let mut values = Vec::with_capacity(sparse_bucket_size);
                 for _ in 0..sparse_bucket_size {
                     values.push(T::deserialize(deserializer));
@@ -897,6 +924,15 @@ where
             }
             if let Some(last) = sparse_buckets.last_mut() {
                 last.set_as_last();
+            }
+
+            // The element and tombstone counts are separate header fields. Trust
+            // the bitmaps, which drive every lookup and growth decision, and
+            // reject a file whose headers disagree with them.
+            if present_count != nb_elements || deleted_count != nb_deleted {
+                return Err(DeserializeError(
+                    "deserialized element or tombstone count does not match the bitmaps",
+                ));
             }
 
             let mut table = Self {
