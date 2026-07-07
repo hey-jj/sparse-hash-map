@@ -95,8 +95,8 @@ where
 {
     /// An empty map with default parts and no allocation.
     ///
-    /// Available for any parameterization whose hasher, comparator, and policy
-    /// are themselves [`Default`]. Places no bound on `K`.
+    /// Available when the hasher and comparator are [`Default`] and the policy
+    /// can build a zero-bucket table. Places no bound on `K`.
     fn default() -> Self {
         Self {
             ht: SparseHash::new(
