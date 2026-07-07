@@ -150,6 +150,7 @@ impl<const NUM: usize, const DEN: usize> Mod<NUM, DEN> {
 
 impl<const NUM: usize, const DEN: usize> GrowthPolicy for Mod<NUM, DEN> {
     fn new(min_bucket_count: usize) -> Result<(Self, usize), LengthError> {
+        assert!(DEN != 0, "growth factor denominator must be nonzero");
         assert!(Self::factor() >= 1.1, "growth factor should be >= 1.1");
 
         if min_bucket_count > Self::max_bucket_count_static() {
@@ -194,6 +195,17 @@ impl<const NUM: usize, const DEN: usize> GrowthPolicy for Mod<NUM, DEN> {
 
     fn clear(&mut self) {
         self.modulo = 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GrowthPolicy, Mod};
+
+    #[test]
+    #[should_panic(expected = "growth factor denominator must be nonzero")]
+    fn mod_policy_rejects_zero_denominator() {
+        let _ = Mod::<2, 0>::new(0);
     }
 }
 
