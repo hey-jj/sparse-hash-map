@@ -575,19 +575,30 @@ where
     }
 
     fn insert_on_rehash(&mut self, value: T) {
-        let hash = self.hash_key(K::key(&value));
-        let mut ibucket = self.bucket_for_hash(hash);
-        let mut probe = 0usize;
         loop {
-            let sib = sparse_ibucket(ibucket);
-            let idx = index_in_sparse_bucket(ibucket);
-            if !self.sparse_buckets[sib].has_value(idx) {
-                self.sparse_buckets[sib].set(idx, value, S::STEP as usize);
-                self.nb_elements += 1;
-                return;
+            let hash = self.hash_key(K::key(&value));
+            let mut ibucket = self.bucket_for_hash(hash);
+            let mut probe = 0usize;
+            loop {
+                if probe >= self.bucket_count {
+                    let count = self
+                        .policy
+                        .next_bucket_count()
+                        .expect("grow within policy limit");
+                    self.rehash_impl(count);
+                    break;
+                }
+
+                let sib = sparse_ibucket(ibucket);
+                let idx = index_in_sparse_bucket(ibucket);
+                if !self.sparse_buckets[sib].has_value(idx) {
+                    self.sparse_buckets[sib].set(idx, value, S::STEP as usize);
+                    self.nb_elements += 1;
+                    return;
+                }
+                probe += 1;
+                ibucket = self.next_bucket(ibucket, probe);
             }
-            probe += 1;
-            ibucket = self.next_bucket(ibucket, probe);
         }
     }
 
@@ -602,6 +613,14 @@ where
     pub fn reserve(&mut self, count: usize) {
         let buckets = (count as f32 / self.max_load_factor()).ceil() as usize;
         self.rehash(buckets);
+    }
+
+    fn can_reserve(&self, count: usize) -> bool {
+        let buckets = (count as f32 / self.max_load_factor()).ceil() as usize;
+        match P::new(buckets) {
+            Ok((_policy, settled)) => settled <= MAX_BUCKET_COUNT,
+            Err(_) => false,
+        }
     }
 }
 
@@ -843,7 +862,9 @@ where
 
         let bucket_count_ds = deserializer.read_u64() as usize;
         let nb_sparse = deserializer.read_u64() as usize;
-        let nb_elements = deserializer.read_u64() as usize;
+        let nb_elements = usize::try_from(deserializer.read_u64()).map_err(|_| {
+            DeserializeError("deserialized element count is too big for the platform")
+        })?;
         let nb_deleted = deserializer.read_u64() as usize;
         let max_load_factor = deserializer.read_f32();
 
@@ -851,6 +872,11 @@ where
             let mut table = Self::new(0, hash, key_eq, DEFAULT_MAX_LOAD_FACTOR)
                 .map_err(|_| DeserializeError("bucket count too big"))?;
             table.set_max_load_factor(max_load_factor);
+            if !table.can_reserve(nb_elements) {
+                return Err(DeserializeError(
+                    "deserialized element count is too large to reserve",
+                ));
+            }
             table.reserve(nb_elements);
             for _ in 0..nb_sparse {
                 let sparse_bucket_size = deserializer.read_u64() as usize;
@@ -995,5 +1021,106 @@ where
             _key: PhantomData,
             _sparsity: PhantomData,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use crate::hasher::{HashKey, StdEq, StdHash};
+    use crate::map::SparseMap;
+    use crate::serialize::{DeserializeError, Deserializer, SERIALIZATION_PROTOCOL_VERSION};
+    use crate::Mod;
+
+    #[derive(Clone)]
+    struct ZeroHash;
+
+    impl HashKey<i64> for ZeroHash {
+        fn hash_key(&self, _key: &i64) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn rehash_with_mod_policy_does_not_loop_on_probe_cycle() {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut map: SparseMap<i64, i64, ZeroHash, StdEq, Mod> =
+                SparseMap::with_parts(43, ZeroHash, StdEq);
+            map.set_max_load_factor(0.8);
+            for i in 0..23 {
+                map.insert(i, i);
+            }
+            tx.send((map.len(), map.bucket_count())).unwrap();
+        });
+
+        let (len, bucket_count) = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("insert sequence should finish");
+        assert_eq!(len, 23);
+        assert!(bucket_count > 43);
+    }
+
+    struct CountHeaderDeserializer {
+        index: usize,
+        nb_elements: u64,
+    }
+
+    impl Deserializer for CountHeaderDeserializer {
+        fn read_u64(&mut self) -> u64 {
+            let values = [SERIALIZATION_PROTOCOL_VERSION, 0, 0, self.nb_elements, 0];
+            let value = values[self.index];
+            self.index += 1;
+            value
+        }
+
+        fn read_f32(&mut self) -> f32 {
+            0.5
+        }
+
+        fn read_bytes(&mut self, _len: usize) -> Vec<u8> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn deserialize_rejects_unreservable_element_count() {
+        let mut deserializer = CountHeaderDeserializer {
+            index: 0,
+            nb_elements: u64::MAX,
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            SparseMap::<i64, i64>::deserialize_with(
+                &mut deserializer,
+                false,
+                StdHash::default(),
+                StdEq,
+            )
+        }));
+
+        match result {
+            Ok(Err(DeserializeError(_))) => {}
+            Ok(Ok(_)) => panic!("deserialize should reject the element count"),
+            Err(_) => panic!("deserialize should return an error"),
+        }
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn deserialize_rejects_element_count_wider_than_usize() {
+        let mut deserializer = CountHeaderDeserializer {
+            index: 0,
+            nb_elements: u64::from(u32::MAX) + 1,
+        };
+        let result = SparseMap::<i64, i64>::deserialize_with(
+            &mut deserializer,
+            false,
+            StdHash::default(),
+            StdEq,
+        );
+
+        assert!(matches!(result, Err(DeserializeError(_))));
     }
 }
